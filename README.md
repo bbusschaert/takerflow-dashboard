@@ -1,29 +1,26 @@
-# Taker-Flow Strategy Dashboard (Streamlit)
+# Taker-Flow Strategy Dashboard (Streamlit) — Fixed Build
 
-A web dashboard to backtest a simple taker-buy ratio strategy against Binance data.
+This build adds:
+- Robust Binance fetch: host rotation, retry/backoff, capped page pulls.
+- Friendly UI errors if data is empty or zero-volume.
+- Plotly `add_hline` compatibility fix.
+- Defensive guards around data fields.
 
-## Features
-- Fetches **Binance klines** (includes `takerBuyBaseVolume`) without API keys.
-- Parameters in the sidebar:
-  - Buy ≥ threshold, Sell ≤ threshold
-  - Trend filter (Close > EMA200), Volume filter (Vol > EMA20)
-  - Fees, initial capital
-- Charts: Equity curve, Price with entries/exits, Taker-ratio panel
-- CSV export of results
-
-## Local Run
+## Quickstart
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
 ## Deploy (Streamlit Community Cloud)
-1. Push these files to a **public GitHub repo**.
-2. Go to https://share.streamlit.io
-3. "New app" → point to your repo → `app.py`
-4. Deploy.
+1. Push these three files to a **public GitHub repo**.
+2. Go to https://share.streamlit.io → **New app**.
+3. Pick your repo, branch `main`, and set **Main file path** to `app.py`.
+4. Deploy. First build may take a few minutes.
 
-## Deploy (Hugging Face Spaces)
-1. Create a new Space → Framework: **Streamlit**
-2. Upload `app.py` and `requirements.txt`
-3. The Space will build and launch automatically.
+## Recommended first run (to verify)
+- Symbol: BTCUSDT
+- Interval: 1h
+- Date range: last 60 days
+- Buy ≥ 0.80, Sell ≤ 0.60
+- Filters ON, Fee 0.001

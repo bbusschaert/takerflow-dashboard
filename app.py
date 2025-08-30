@@ -6,33 +6,68 @@ import time
 import datetime as dt
 import plotly.graph_objects as go
 
-BINANCE_BASE = "https://api.binance.com"
-
-INTERVALS = {
-    "15m": "15m",
-    "1h": "1h",
-    "4h": "4h"
-}
+HOSTS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+INTERVALS = ["15m", "1h", "4h"]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; TakerFlow/1.0; +streamlit)",
+    "Accept": "application/json",
+}
 
 def fetch_klines(symbol: str, interval: str, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+    """
+    Robust fetch of Binance klines (no API key).
+    - Rotates between public hosts on 403/429/5xx gateway issues.
+    - Caps total pages to avoid runaway loops on free hosting.
+    - Returns empty DataFrame on persistent failure so UI can handle gracefully.
+    """
+    if start >= end:
+        return pd.DataFrame()
+
     limit = 1000
-    url = f"{BINANCE_BASE}/api/v3/klines"
+    max_pulls = 30
+
+    frames = []
+    pulls = 0
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    host_idx = 0
+    url = f"{HOSTS[host_idx]}/api/v3/klines"
     params = {
         "symbol": symbol.upper(),
         "interval": interval,
         "limit": limit,
-        "startTime": int(start.timestamp() * 1000),
-        "endTime": int(end.timestamp() * 1000)
+        "startTime": start_ms,
+        "endTime": end_ms,
     }
-    frames = []
-    while True:
-        r = requests.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+
+    while pulls < max_pulls:
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            status = r.status_code
+
+            if status in (403, 429, 451, 520, 521, 522, 523, 524):
+                host_idx = (host_idx + 1) % len(HOSTS)
+                url = f"{HOSTS[host_idx]}/api/v3/klines"
+                time.sleep(1.0)
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException:
+            break
+
         if not data:
             break
+
         df = pd.DataFrame(data, columns=[
             "open_time","open","high","low","close","volume","close_time","quote_volume",
             "num_trades","taker_buy_base","taker_buy_quote","ignore"
@@ -41,15 +76,21 @@ def fetch_klines(symbol: str, interval: str, start: dt.datetime, end: dt.datetim
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
         frames.append(df)
+
+        pulls += 1
         last_open = int(df["open_time"].iloc[-1].timestamp() * 1000)
-        params["startTime"] = last_open + 1
-        if len(data) < limit or params["startTime"] >= params["endTime"]:
+        next_start = last_open + 1
+        if len(data) < limit or next_start >= end_ms:
             break
-        time.sleep(0.2)
+
+        params["startTime"] = next_start
+        time.sleep(0.25)
+
     if not frames:
         return pd.DataFrame()
+
     out = pd.concat(frames, ignore_index=True)
-    out = out.loc[out["open_time"] < pd.to_datetime(int(end.timestamp()*1000), unit="ms", utc=True)]
+    out = out.loc[out["open_time"] < pd.to_datetime(end_ms, unit="ms", utc=True)]
     return out.reset_index(drop=True)
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -59,6 +100,12 @@ def backtest(df: pd.DataFrame, buy_thr: float, sell_thr: float,
              use_trend_filter: bool, use_volume_filter: bool,
              fee_per_side: float, initial_capital: float):
     df = df.copy()
+
+    df["volume"] = df["volume"].replace(0, np.nan)
+    df = df.dropna(subset=["volume"]).reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(), {"Total Return %":0, "Max Drawdown %":0, "# Trades":0, "Win Rate %":0}, {"entries": [], "exits": []}
+
     df["taker_ratio"] = (df["taker_buy_base"] / df["volume"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["ema200"] = ema(df["close"], 200)
     df["vol_ema20"] = ema(df["volume"], 20)
@@ -68,7 +115,6 @@ def backtest(df: pd.DataFrame, buy_thr: float, sell_thr: float,
     entries, exits = [], []
     trade_pnls = []
     entry_equity = None
-    entry_price  = None
 
     for i in range(len(df)-1):
         price = df["close"].iloc[i]
@@ -85,7 +131,6 @@ def backtest(df: pd.DataFrame, buy_thr: float, sell_thr: float,
             holding = True
             entries.append((df["open_time"].iloc[i], float(price)))
             entry_equity = e
-            entry_price = price
         elif holding and exit_ok:
             e *= (1 - fee_per_side)
             holding = False
@@ -93,7 +138,6 @@ def backtest(df: pd.DataFrame, buy_thr: float, sell_thr: float,
             if entry_equity is not None:
                 trade_pnls.append(e - entry_equity)
                 entry_equity = None
-                entry_price = None
 
         if holding:
             e *= np.exp(next_ret)
@@ -117,12 +161,11 @@ def backtest(df: pd.DataFrame, buy_thr: float, sell_thr: float,
     win_rate = (np.mean([1 if p>0 else 0 for p in trade_pnls]) * 100.0) if n_trades>0 else 0.0
 
     kpis = {
-        "Total Return %": round(total_return, 2),
+        "Total Return %": round(float(total_return), 2),
         "Max Drawdown %": round(float(max_dd), 2),
         "# Trades": int(n_trades),
-        "Win Rate %": round(float(win_rate), 2)
+        "Win Rate %": round(float(win_rate), 2),
     }
-
     annotations = {"entries": entries, "exits": exits}
     return result, kpis, annotations
 
@@ -140,7 +183,6 @@ def plot_price_with_trades(df: pd.DataFrame, ann):
         name="Price"
     ))
     fig.add_trace(go.Scatter(x=df["open_time"], y=ema(df["close"], 200), mode="lines", name="EMA200"))
-
     if ann["entries"]:
         xs, ys = zip(*ann["entries"])
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers", name="Entry", marker=dict(symbol="triangle-up", size=10)))
@@ -153,7 +195,7 @@ def plot_price_with_trades(df: pd.DataFrame, ann):
 def ui_sidebar():
     st.sidebar.header("Parameters")
     symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0)
-    interval = st.sidebar.selectbox("Interval", list(INTERVALS.values()), index=1)
+    interval = st.sidebar.selectbox("Interval", INTERVALS, index=1)
     end_date = st.sidebar.date_input("End Date (UTC)", dt.datetime.utcnow().date())
     start_date = st.sidebar.date_input("Start Date (UTC)", end_date - dt.timedelta(days=60))
     buy_thr = st.sidebar.slider("Buy Threshold (taker ratio ≥)", 0.50, 0.99, 0.80, 0.01)
@@ -186,11 +228,29 @@ def main():
 
     with st.spinner("Fetching data from Binance..."):
         df = fetch_klines(cfg["symbol"], cfg["interval"], cfg["start"], cfg["end"])
+
     if df.empty:
-        st.error("No data returned. Try a different date range/symbol/interval.")
+        st.error(
+            "No data fetched from Binance.\n\n"
+            "Possible reasons:\n"
+            "• Temporary rate limit/block on this cloud IP (we rotate hosts automatically).\n"
+            "• Date range too large for the chosen interval.\n"
+            "• Network hiccup.\n\n"
+            "Try again, or shorten the date range (e.g., 30–60 days) and use 1h/4h intervals."
+        )
         st.stop()
 
-    st.success(f"Fetched {len(df)} candles for {cfg['symbol']} ({cfg['interval']}).")
+    # Sanity checks to avoid div-by-zero in ratio
+    needed = {"volume","taker_buy_base","close","open_time"}
+    if not needed.issubset(df.columns):
+        st.error("The Binance response is missing expected fields. Please try a different symbol/interval.")
+        st.stop()
+
+    df["volume"] = df["volume"].replace(0, np.nan)
+    df = df.dropna(subset=["volume"]).reset_index(drop=True)
+    if df.empty:
+        st.error("Data contains zero-volume candles only. Try a different range or symbol.")
+        st.stop()
 
     result, kpis, ann = backtest(
         df, cfg["buy_thr"], cfg["sell_thr"],
@@ -209,8 +269,8 @@ def main():
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=result["time"], y=result["taker_ratio"], mode="lines", name="Taker Buy Ratio"))
-    fig.add_hline(y=cfg["buy_thr"], line=dict(color="green", dash="dot"))
-    fig.add_hline(y=cfg["sell_thr"], line=dict(color="red", dash="dot"))
+    fig.add_hline(y=cfg["buy_thr"], line_color="green", line_dash="dot")
+    fig.add_hline(y=cfg["sell_thr"], line_color="red", line_dash="dot")
     fig.update_layout(title="Taker Buy Ratio")
     st.plotly_chart(fig, use_container_width=True)
 
